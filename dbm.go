@@ -1,0 +1,502 @@
+package dbm
+
+// Copyright © Caldera International Inc.  2001-2002
+// Limbo transliteration (with amendment) Copyright © 2004 Vita Nuova Holdings Limited
+// Go version Copyright © 2024 Charles Forsyth (charles.forsyth@gmail.com)
+
+import (
+	//	"encoding/binary"
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+)
+
+const (
+	byteBits   = 8
+	shortBytes = 2
+
+	pageBlockSize = 512
+	dirBlockSize  = 8192
+)
+
+var (
+	ErrCorrupt   = errors.New("corrupt data block")
+	ErrDuplicate = errors.New("key already exists")
+	ErrReadOnly  = errors.New("read-only file")
+)
+
+type DBM struct {
+	dirf      *os.File // directory file
+	pagf      *os.File // page file
+	writable  bool
+	maxbno    int64 // last `bno' in page file
+	bitno     int64
+	hmask     uint32
+	blkno     int64 // current page to read/write
+	pageBlkno int64 // current page in pageBuf
+	pageBuf   []byte
+	dirBlkno  int64 // current block in dirBuf
+	dirBuf    []byte
+}
+
+func Create(file string) (*DBM, error) {
+	pf, err := os.Create(file + ".pag")
+	if err != nil {
+		return nil, err
+	}
+	df, err := os.Create(file + ".dir")
+	if err != nil {
+		return nil, err
+	}
+	return alloc(pf, df, true)
+}
+
+func Open(file string) (*DBM, error) {
+	return OpenFile(file, os.O_RDONLY, 0o666)
+}
+
+func OpenFile(file string, flag int, perms os.FileMode) (*DBM, error) {
+	pf, err := os.OpenFile(file+".pag", flag, perms)
+	if err != nil {
+		return nil, err
+	}
+	df, err := os.OpenFile(file+".dir", flag, perms)
+	if err != nil {
+		return nil, err
+	}
+	return alloc(pf, df, flag != os.O_RDONLY)
+}
+
+func alloc(pf *os.File, df *os.File, writable bool) (*DBM, error) {
+	d, err := pf.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("dbm cannot get file size: %v", err)
+	}
+	db := &DBM{
+		pagf:      pf,
+		dirf:      df,
+		writable:  writable,
+		pageBuf:   make([]byte, pageBlockSize),
+		dirBuf:    make([]byte, dirBlockSize),
+		pageBlkno: -1,
+		dirBlkno:  -1,
+		maxbno:    d.Size()*byteBits - 1,
+	}
+	return db, nil
+}
+
+func (db *DBM) Flush() {
+	db.pageBlkno = -1
+	db.dirBlkno = -1
+}
+
+func (db *DBM) IsReadOnly() bool {
+	return !db.writable
+}
+
+func (db *DBM) Fetch(key []byte) ([]byte, error) {
+	db.access(calcHash(key))
+	for i := 0; ; i += shortBytes {
+		item := mkItem(db.pageBuf, i)
+		if item == nil {
+			return nil, ErrCorrupt
+		}
+		if cmpdatum(key, item) == 0 {
+			item = mkItem(db.pageBuf, i+1)
+			if item == nil {
+				return nil, errors.New("items not in pairs")
+			}
+			return item, nil
+		}
+	}
+}
+
+func (db *DBM) Delete(key []byte) error {
+	if db.IsReadOnly() {
+		return ErrReadOnly
+	}
+	db.access(calcHash(key))
+	for i := 0; ; i += shortBytes {
+		item := mkItem(db.pageBuf, i)
+		if item == nil {
+			return nil // entry not found
+		}
+		if cmpdatum(key, item) == 0 {
+			delItem(db.pageBuf, i)
+			delItem(db.pageBuf, i)
+			break
+		}
+	}
+	db.pageBlkno = db.blkno
+	return writeBlock(db.pagf, db.pageBuf, db.blkno)
+}
+
+func (db *DBM) Store(key []byte, dat []byte, replace bool) error {
+	if db.IsReadOnly() {
+		return ErrReadOnly
+	}
+	for {
+		db.access(calcHash(key))
+		for i := 0; ; i += shortBytes {
+			item := mkItem(db.pageBuf, i)
+			if item == nil {
+				break
+			}
+			if cmpdatum(key, item) == 0 {
+				if !replace {
+					return ErrDuplicate
+				}
+				delItem(db.pageBuf, i)
+				delItem(db.pageBuf, i)
+				break
+			}
+		}
+		i := addItem(db.pageBuf, key)
+		if i >= 0 {
+			if addItem(db.pageBuf, dat) >= 0 {
+				break
+			}
+			delItem(db.pageBuf, i)
+		}
+		if err := db.split(key, dat); err != nil {
+			return err
+		}
+	}
+	db.pageBlkno = db.blkno
+	return writeBlock(db.pagf, db.pageBuf, db.blkno)
+}
+
+func (db *DBM) split(key []byte, dat []byte) error {
+	if len(key)+len(dat)+3*shortBytes >= pageBlockSize {
+		return errors.New("key/value too large")
+	}
+	ovfbuf := make([]byte, pageBlockSize)
+	for i := 0; ; {
+		item := mkItem(db.pageBuf, i)
+		if item == nil {
+			break
+		}
+		if (calcHash(item) & (db.hmask + 1)) != 0 {
+			addItem(ovfbuf, item)
+			delItem(db.pageBuf, i)
+			item = mkItem(db.pageBuf, i)
+			if item == nil {
+				return errors.New("split not paired")
+			}
+			addItem(ovfbuf, item)
+			delItem(db.pageBuf, i)
+			continue
+		}
+		i += shortBytes
+	}
+	err := writeBlock(db.pagf, db.pageBuf, db.blkno)
+	if err != nil {
+		return err
+	}
+	db.pageBlkno = db.blkno
+	err = writeBlock(db.pagf, ovfbuf, db.blkno+int64(db.hmask+1))
+	if err != nil {
+		return err
+	}
+	db.setBit()
+	return nil
+}
+
+func (db *DBM) FirstKey() []byte {
+	return bytes.Clone(db.firstHash(0))
+}
+
+func (db *DBM) NextKey(key []byte) []byte {
+	hash := calcHash(key)
+	db.access(hash)
+	var item, bitem []byte
+	for i := 0; ; i += shortBytes {
+		item = mkItem(db.pageBuf, i)
+		if item == nil {
+			break
+		}
+		if cmpdatum(key, item) <= 0 {
+			continue
+		}
+		if bitem == nil || cmpdatum(bitem, item) < 0 {
+			bitem = item
+		}
+	}
+	if bitem != nil {
+		return bytes.Clone(bitem)
+	}
+	hash = db.hashInc(hash)
+	if hash == 0 {
+		return bytes.Clone(item)
+	}
+	return bytes.Clone(db.firstHash(hash))
+}
+
+func (db *DBM) firstHash(hash uint32) []byte {
+	for {
+		db.access(hash)
+		bitem := mkItem(db.pageBuf, 0)
+		var item []byte
+		for i := shortBytes; ; i += shortBytes {
+			item = mkItem(db.pageBuf, i)
+			if item == nil {
+				break
+			}
+			if cmpdatum(bitem, item) < 0 {
+				bitem = item
+			}
+		}
+		if bitem != nil {
+			return bitem
+		}
+		hash = db.hashInc(hash)
+		if hash == 0 {
+			return item
+		}
+	}
+}
+
+func (db *DBM) access(hash uint32) error {
+	for db.hmask = 0; ; db.hmask = (db.hmask << 1) + 1 {
+		db.blkno = int64(hash & db.hmask)
+		db.bitno = db.blkno + int64(db.hmask)
+		b, err := db.getBit()
+		if err != nil {
+			return err
+		}
+		if b == 0 {
+			break
+		}
+	}
+	if db.blkno != db.pageBlkno {
+		err := readBlock(db.pagf, db.pageBuf, db.blkno)
+		if err != nil {
+			return err
+		}
+		err = checkBlock(db.pageBuf)
+		if err != nil {
+			return err
+		}
+		db.pageBlkno = db.blkno
+	}
+	return nil
+}
+
+func (db *DBM) getBit() (byte, error) {
+	if db.bitno > db.maxbno {
+		return 0, nil
+	}
+	n := db.bitno % byteBits
+	bn := db.bitno / byteBits
+	i := bn % dirBlockSize
+	b := bn / dirBlockSize
+	if b != db.dirBlkno {
+		err := readBlock(db.dirf, db.dirBuf, b)
+		if err != nil {
+			return 0, err
+		}
+		db.dirBlkno = b
+	}
+	return db.dirBuf[i] & (1 << n), nil
+}
+
+func (db *DBM) setBit() error {
+	if db.bitno > db.maxbno {
+		db.maxbno = db.bitno
+		_, err := db.getBit()
+		if err != nil {
+			return err
+		}
+	}
+	n := db.bitno % byteBits
+	bn := db.bitno / byteBits
+	i := bn % dirBlockSize
+	b := bn / dirBlockSize
+	db.dirBuf[i] |= byte(1 << n)
+	db.dirBlkno = b
+	return writeBlock(db.dirf, db.dirBuf, b)
+}
+
+func mkItem(buf []byte, n int) []byte {
+	ne := get16(buf, 0)
+	if n < 0 || n >= ne {
+		return nil
+	}
+	t := pageBlockSize
+	if n > 0 {
+		t = get16(buf, n+1-1)
+	}
+	v := get16(buf, n+1)
+	return buf[v:t] // size is t-v
+}
+
+func cmpdatum(d1 []byte, d2 []byte) int {
+	n := len(d1)
+	if n != len(d2) {
+		return n - len(d2)
+	}
+	if n == 0 {
+		return 0
+	}
+	for i := 0; i < len(d1); i++ {
+		if d1[i] != d2[i] {
+			return int(d1[i]) - int(d2[i])
+		}
+	}
+	return 0
+}
+
+// ken's
+//
+//	055,043,036,054,063,014,004,005,
+//	010,064,077,000,035,027,025,071,
+//
+
+var hitab = [16]uint32{
+	61, 57, 53, 49, 45, 41, 37, 33,
+	29, 25, 21, 17, 13, 9, 5, 1,
+}
+
+var hltab = [64]uint32{
+	0o6100151277, 0o6106161736, 0o6452611562, 0o5001724107,
+	0o2614772546, 0o4120731531, 0o4665262210, 0o7347467531,
+	0o6735253126, 0o6042345173, 0o3072226605, 0o1464164730,
+	0o3247435524, 0o7652510057, 0o1546775256, 0o5714532133,
+	0o6173260402, 0o7517101630, 0o2431460343, 0o1743245566,
+	0o0261675137, 0o2433103631, 0o3421772437, 0o4447707466,
+	0o4435620103, 0o3757017115, 0o3641531772, 0o6767633246,
+	0o2673230344, 0o0260612216, 0o4133454451, 0o0615531516,
+	0o6137717526, 0o2574116560, 0o2304023373, 0o7061702261,
+	0o5153031405, 0o5322056705, 0o7401116734, 0o6552375715,
+	0o6165233473, 0o5311063631, 0o1212221723, 0o1052267235,
+	0o6000615237, 0o1075222665, 0o6330216006, 0o4402355630,
+	0o1451177262, 0o2000133436, 0o6025467062, 0o7121076461,
+	0o3123433522, 0o1010635225, 0o1716177066, 0o5161746527,
+	0o1736635071, 0o6243505026, 0o3637211610, 0o1756474365,
+	0o4723077174, 0o3642763134, 0o5750130273, 0o3655541561,
+}
+
+func (db *DBM) hashInc(hash uint32) uint32 {
+	hash &= db.hmask
+	bit := db.hmask + 1
+	for {
+		bit >>= 1
+		if bit == 0 {
+			return 0
+		}
+		if (hash & bit) == 0 {
+			return hash | bit
+		}
+		hash &= ^bit
+	}
+}
+
+func calcHash(item []byte) uint32 {
+	hashl := uint32(0)
+	hashi := uint32(0)
+	for i := 0; i < len(item); i++ {
+		f := int(item[i])
+		for j := 0; j < byteBits; j += 4 {
+			hashi += hitab[f&0xF]
+			hashl += hltab[hashi&0x3F]
+			f >>= 4
+		}
+	}
+	return hashl
+}
+
+func delItem(buf []byte, n int) error {
+	ne := get16(buf, 0)
+	if n < 0 || n >= ne {
+		return fmt.Errorf("corrupt file: bad item index: %d", n)
+	}
+	i1 := get16(buf, n+1)
+	i2 := pageBlockSize
+	if n > 0 {
+		i2 = get16(buf, n+1-1)
+	}
+	i3 := get16(buf, ne+1-1)
+	if i2 > i1 {
+		for i1 > i3 {
+			i1--
+			i2--
+			buf[i2] = buf[i1]
+			buf[i1] = 0
+		}
+	}
+	i2 -= i1
+	for i1 = n + 1; i1 < ne; i1++ {
+		put16(buf, i1+1-1, get16(buf, i1+1)+i2)
+	}
+	put16(buf, 0, ne-1)
+	put16(buf, ne, 0)
+	return nil
+}
+
+func addItem(buf []byte, item []byte) int {
+	i1 := pageBlockSize
+	ne := get16(buf, 0)
+	if ne > 0 {
+		i1 = get16(buf, ne+1-1)
+	}
+	i1 -= len(item)
+	i2 := (ne + 2) * shortBytes
+	if i1 <= i2 {
+		return -1
+	}
+	put16(buf, ne+1, i1)
+	copy(buf[i1:], item)
+	put16(buf, 0, ne+1)
+	return ne
+}
+
+func checkBlock(buf []byte) error {
+	t := pageBlockSize
+	ne := get16(buf, 0)
+	for i := 0; i < ne; i++ {
+		v := get16(buf, i+1)
+		if v > t {
+			return ErrCorrupt
+		}
+		t = v
+	}
+	if t < (ne+1)*shortBytes {
+		return ErrCorrupt
+	}
+	return nil
+}
+
+func readBlock(fd *os.File, buf []byte, blk int64) error {
+	n := len(buf)
+	nr, err := fd.ReadAt(buf, blk*int64(n))
+	if err != nil {
+		return fmt.Errorf("db i/o error: %v", err)
+	}
+	if nr != 0 && nr != n {
+		return fmt.Errorf("db i/o error: short read: want %d got %d", n, nr)
+	}
+	if nr == 0 {
+		clear(buf)
+	}
+	return nil
+}
+
+func writeBlock(fd *os.File, buf []byte, blk int64) error {
+	_, err := fd.WriteAt(buf, blk*int64(len(buf)))
+	if err != nil {
+		return fmt.Errorf("db write error: %v", err)
+	}
+	return nil
+}
+
+func get16(buf []byte, sh int) int {
+	sh *= shortBytes
+	return int(buf[sh])<<8 | int(buf[sh+1])
+}
+
+func put16(buf []byte, sh int, v int) {
+	sh *= shortBytes
+	buf[sh] = byte(v >> 8)
+	buf[sh+1] = byte(v)
+}
