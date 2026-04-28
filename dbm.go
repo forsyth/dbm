@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -16,23 +17,30 @@ const (
 	byteBits   = 8
 	shortBytes = 2
 
-	pageBlockSize = 512
+	pageBlockSize = 512 // tiny for this century
 	dirBlockSize  = 8192
 )
 
 var (
-	ErrCorrupt   = errors.New("corrupt data block")
-	ErrDuplicate = errors.New("key already exists")
-	ErrReadOnly  = errors.New("read-only file")
+	ErrCorrupt        = errors.New("corrupt data block")
+	ErrDuplicate      = errors.New("key already exists")
+	ErrNotFound       = errors.New("key not found")
+	ErrNotPaired      = errors.New("items not in pairs")
+	ErrReadOnly       = errors.New("read-only file")
+	ErrSplitNotPaired = errors.New("split not paired")
+	ErrTooLarge       = errors.New("key/value too large")
 )
 
-type DBM struct {
+type hash uint32
+
+// File represents an open database instance.
+type File struct {
 	dirf      *os.File // directory file
 	pagf      *os.File // page file
 	writable  bool
 	maxbno    int64 // last `bno' in page file
 	bitno     int64
-	hmask     uint32
+	hmask     hash
 	blkno     int64 // current page to read/write
 	pageBlkno int64 // current page in pageBuf
 	pageBuf   []byte
@@ -40,40 +48,47 @@ type DBM struct {
 	dirBuf    []byte
 }
 
-func Create(file string) (*DBM, error) {
-	pf, err := os.Create(file + ".pag")
+// Create makes a new dbm database, with the given name as the base name,
+// and returns a File that can access it.
+// Currently a database has two underlying storage files for a given name N: N.pag and N.dat.
+func Create(name string) (*File, error) {
+	pf, err := os.Create(name + ".pag")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot create %s.pag: %w", err)
 	}
-	df, err := os.Create(file + ".dir")
+	df, err := os.Create(name + ".dir")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot create %s.dir: %w", err)
 	}
 	return alloc(pf, df, true)
 }
 
-func Open(file string) (*DBM, error) {
-	return OpenFile(file, os.O_RDONLY, 0o666)
+// Open opens the dbm file for reading and writing.
+func Open(name string) (*File, error) {
+	return OpenFile(name, os.O_RDWR, 0o666)
 }
 
-func OpenFile(file string, flag int, perms os.FileMode) (*DBM, error) {
-	pf, err := os.OpenFile(file+".pag", flag, perms)
+// OpenFile opens the dbm file in the mode given by flag:
+// O_RDONLY for only reading, or O_RDWR for reading and writing (updating).
+// An error is returned if any underlying OS files cannot be opened.
+func OpenFile(name string, flag int, perms os.FileMode) (*File, error) {
+	pf, err := os.OpenFile(name+".pag", flag, perms)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot open %s.pag: %w", err)
 	}
-	df, err := os.OpenFile(file+".dir", flag, perms)
+	df, err := os.OpenFile(name+".dir", flag, perms)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot open %s.dir: %w", err)
 	}
 	return alloc(pf, df, flag != os.O_RDONLY)
 }
 
-func alloc(pf *os.File, df *os.File, writable bool) (*DBM, error) {
+func alloc(pf *os.File, df *os.File, writable bool) (*File, error) {
 	d, err := pf.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("dbm cannot get file size: %v", err)
+		return nil, fmt.Errorf("dbm cannot get file size: %w", err)
 	}
-	db := &DBM{
+	db := &File{
 		pagf:      pf,
 		dirf:      df,
 		writable:  writable,
@@ -86,43 +101,69 @@ func alloc(pf *os.File, df *os.File, writable bool) (*DBM, error) {
 	return db, nil
 }
 
-func (db *DBM) Flush() {
+// Reset discards the in-memory cache.
+func (db *File) Reset() {
 	db.pageBlkno = -1
 	db.dirBlkno = -1
 }
 
-func (db *DBM) IsReadOnly() bool {
+// Flush flushes any cached but unwritten data and clears the caches.
+func (db *File) Flush() {
+	// nothing volatile to flush, but discard cache
+	db.Reset()
+}
+
+// Close flushes any cached data and closes the underlying OS files.
+func (db *File) Close() {
+	db.Flush()
+	db.dirf.Close()
+	db.pagf.Close()
+}
+
+// IsReadOnly returns true iff the file was opened only for reading and cannot be updated.
+func (db *File) IsReadOnly() bool {
 	return !db.writable
 }
 
-func (db *DBM) Fetch(key []byte) ([]byte, error) {
-	db.access(calcHash(key))
+// Fetch returns the data associated with the given key,
+// or nil if key does not exist.
+// If an error is returned, the database is in bad shape.
+func (db *File) Fetch(key []byte) ([]byte, error) {
+	err := db.access(calchash(key))
+	if err != nil {
+		return nil, err
+	}
 	for i := 0; ; i += shortBytes {
 		item := mkItem(db.pageBuf, i)
 		if item == nil {
 			return nil, ErrCorrupt
 		}
-		if cmpdatum(key, item) == 0 {
+		if cmpDatum(key, item) == 0 {
 			item = mkItem(db.pageBuf, i+1)
 			if item == nil {
-				return nil, errors.New("items not in pairs")
+				return nil, ErrNotPaired
 			}
 			return item, nil
 		}
 	}
 }
 
-func (db *DBM) Delete(key []byte) error {
+// Delete deletes the data associated with key, or returns error ErrNotFound.
+// If any other error is returned, the database is read-only or in bad shape.
+func (db *File) Delete(key []byte) error {
 	if db.IsReadOnly() {
 		return ErrReadOnly
 	}
-	db.access(calcHash(key))
+	err := db.access(calchash(key))
+	if err != nil {
+		return err
+	}
 	for i := 0; ; i += shortBytes {
 		item := mkItem(db.pageBuf, i)
 		if item == nil {
-			return nil // entry not found
+			return ErrNotFound
 		}
-		if cmpdatum(key, item) == 0 {
+		if cmpDatum(key, item) == 0 {
 			delItem(db.pageBuf, i)
 			delItem(db.pageBuf, i)
 			break
@@ -132,18 +173,25 @@ func (db *DBM) Delete(key []byte) error {
 	return writeBlock(db.pagf, db.pageBuf, db.blkno)
 }
 
-func (db *DBM) Store(key []byte, dat []byte, replace bool) error {
+// Store stores the (key, data) pair.
+// If replace is true and key already has an associated value, Store replaces that by the new data;
+// otherwise it returns error ErrDuplicate.
+// On success, nil is returned.
+func (db *File) Store(key []byte, data []byte, replace bool) error {
 	if db.IsReadOnly() {
 		return ErrReadOnly
 	}
 	for {
-		db.access(calcHash(key))
+		err := db.access(calchash(key))
+		if err != nil {
+			return err
+		}
 		for i := 0; ; i += shortBytes {
 			item := mkItem(db.pageBuf, i)
 			if item == nil {
 				break
 			}
-			if cmpdatum(key, item) == 0 {
+			if cmpDatum(key, item) == 0 {
 				if !replace {
 					return ErrDuplicate
 				}
@@ -154,12 +202,12 @@ func (db *DBM) Store(key []byte, dat []byte, replace bool) error {
 		}
 		i := addItem(db.pageBuf, key)
 		if i >= 0 {
-			if addItem(db.pageBuf, dat) >= 0 {
+			if addItem(db.pageBuf, data) >= 0 {
 				break
 			}
 			delItem(db.pageBuf, i)
 		}
-		if err := db.split(key, dat); err != nil {
+		if err := db.split(key, data); err != nil {
 			return err
 		}
 	}
@@ -167,9 +215,19 @@ func (db *DBM) Store(key []byte, dat []byte, replace bool) error {
 	return writeBlock(db.pagf, db.pageBuf, db.blkno)
 }
 
-func (db *DBM) split(key []byte, dat []byte) error {
-	if len(key)+len(dat)+3*shortBytes >= pageBlockSize {
-		return errors.New("key/value too large")
+// MaxRecord returns the size of the largest key and data combination allowed.
+func (db *File) MaxRecord() int {
+	return pageBlockSize - 4*shortBytes
+}
+
+// RecordFits returns true iff the given key and data can be stored in the database.
+func (db *File) RecordFits(key []byte, dat []byte) bool {
+	return len(key)+len(dat)+4*shortBytes <= pageBlockSize
+}
+
+func (db *File) split(key []byte, dat []byte) error {
+	if !db.RecordFits(key, dat) {
+		return ErrTooLarge
 	}
 	ovfbuf := make([]byte, pageBlockSize)
 	for i := 0; ; {
@@ -177,12 +235,12 @@ func (db *DBM) split(key []byte, dat []byte) error {
 		if item == nil {
 			break
 		}
-		if (calcHash(item) & (db.hmask + 1)) != 0 {
+		if (calchash(item) & (db.hmask + 1)) != 0 {
 			addItem(ovfbuf, item)
 			delItem(db.pageBuf, i)
 			item = mkItem(db.pageBuf, i)
 			if item == nil {
-				return errors.New("split not paired")
+				return ErrSplitNotPaired
 			}
 			addItem(ovfbuf, item)
 			delItem(db.pageBuf, i)
@@ -203,39 +261,57 @@ func (db *DBM) split(key []byte, dat []byte) error {
 	return nil
 }
 
-func (db *DBM) FirstKey() []byte {
-	return bytes.Clone(db.firstHash(0))
+// FirstKey returns the value of the first key in the database
+// in an internal database ordering, to start iterating over the set of keys.
+func (db *File) FirstKey() ([]byte, error) {
+	key, err := db.firstHash(0)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.Clone(key), nil
 }
 
-func (db *DBM) NextKey(key []byte) []byte {
-	hash := calcHash(key)
-	db.access(hash)
+// NextKey returns the value of the key immediately following the given one,
+// to continue iterating over the set of keys.
+func (db *File) NextKey(key []byte) ([]byte, error) {
+	hash := calchash(key)
+	err := db.access(hash)
+	if err != nil {
+		return nil, err
+	}
 	var item, bitem []byte
 	for i := 0; ; i += shortBytes {
 		item = mkItem(db.pageBuf, i)
 		if item == nil {
 			break
 		}
-		if cmpdatum(key, item) <= 0 {
+		if cmpDatum(key, item) <= 0 {
 			continue
 		}
-		if bitem == nil || cmpdatum(bitem, item) < 0 {
+		if bitem == nil || cmpDatum(bitem, item) < 0 {
 			bitem = item
 		}
 	}
 	if bitem != nil {
-		return bytes.Clone(bitem)
+		return bytes.Clone(bitem), nil
 	}
 	hash = db.hashInc(hash)
 	if hash == 0 {
-		return bytes.Clone(item)
+		return bytes.Clone(item), nil
 	}
-	return bytes.Clone(db.firstHash(hash))
+	fh, err := db.firstHash(hash)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.Clone(fh), nil
 }
 
-func (db *DBM) firstHash(hash uint32) []byte {
+func (db *File) firstHash(hash hash) ([]byte, error) {
 	for {
-		db.access(hash)
+		err := db.access(hash)
+		if err != nil {
+			return nil, err
+		}
 		bitem := mkItem(db.pageBuf, 0)
 		var item []byte
 		for i := shortBytes; ; i += shortBytes {
@@ -243,21 +319,21 @@ func (db *DBM) firstHash(hash uint32) []byte {
 			if item == nil {
 				break
 			}
-			if cmpdatum(bitem, item) < 0 {
+			if cmpDatum(bitem, item) < 0 {
 				bitem = item
 			}
 		}
 		if bitem != nil {
-			return bitem
+			return bitem, nil
 		}
 		hash = db.hashInc(hash)
 		if hash == 0 {
-			return item
+			return item, nil
 		}
 	}
 }
 
-func (db *DBM) access(hash uint32) error {
+func (db *File) access(hash hash) error {
 	for db.hmask = 0; ; db.hmask = (db.hmask << 1) + 1 {
 		db.blkno = int64(hash & db.hmask)
 		db.bitno = db.blkno + int64(db.hmask)
@@ -283,7 +359,7 @@ func (db *DBM) access(hash uint32) error {
 	return nil
 }
 
-func (db *DBM) getBit() (byte, error) {
+func (db *File) getBit() (byte, error) {
 	if db.bitno > db.maxbno {
 		return 0, nil
 	}
@@ -301,7 +377,7 @@ func (db *DBM) getBit() (byte, error) {
 	return db.dirBuf[i] & (1 << n), nil
 }
 
-func (db *DBM) setBit() error {
+func (db *File) setBit() error {
 	if db.bitno > db.maxbno {
 		db.maxbno = db.bitno
 		_, err := db.getBit()
@@ -328,10 +404,10 @@ func mkItem(buf []byte, n int) []byte {
 		t = get16(buf, n+1-1)
 	}
 	v := get16(buf, n+1)
-	return buf[v:t] // size is t-v
+	return buf[v:t]
 }
 
-func cmpdatum(d1 []byte, d2 []byte) int {
+func cmpDatum(d1 []byte, d2 []byte) int {
 	n := len(d1)
 	if n != len(d2) {
 		return n - len(d2)
@@ -339,7 +415,7 @@ func cmpdatum(d1 []byte, d2 []byte) int {
 	if n == 0 {
 		return 0
 	}
-	for i := 0; i < len(d1); i++ {
+	for i := range d1 {
 		if d1[i] != d2[i] {
 			return int(d1[i]) - int(d2[i])
 		}
@@ -353,12 +429,12 @@ func cmpdatum(d1 []byte, d2 []byte) int {
 //	010,064,077,000,035,027,025,071,
 //
 
-var hitab = [16]uint32{
+var hitab = [16]hash{
 	61, 57, 53, 49, 45, 41, 37, 33,
 	29, 25, 21, 17, 13, 9, 5, 1,
 }
 
-var hltab = [64]uint32{
+var hltab = [64]hash{
 	0o6100151277, 0o6106161736, 0o6452611562, 0o5001724107,
 	0o2614772546, 0o4120731531, 0o4665262210, 0o7347467531,
 	0o6735253126, 0o6042345173, 0o3072226605, 0o1464164730,
@@ -377,7 +453,7 @@ var hltab = [64]uint32{
 	0o4723077174, 0o3642763134, 0o5750130273, 0o3655541561,
 }
 
-func (db *DBM) hashInc(hash uint32) uint32 {
+func (db *File) hashInc(hash hash) hash {
 	hash &= db.hmask
 	bit := db.hmask + 1
 	for {
@@ -392,9 +468,9 @@ func (db *DBM) hashInc(hash uint32) uint32 {
 	}
 }
 
-func calcHash(item []byte) uint32 {
-	hashl := uint32(0)
-	hashi := uint32(0)
+func calchash(item []byte) hash {
+	hashl := hash(0)
+	hashi := hash(0)
 	for i := 0; i < len(item); i++ {
 		f := int(item[i])
 		for j := 0; j < byteBits; j += 4 {
@@ -471,13 +547,11 @@ func readBlock(fd *os.File, buf []byte, blk int64) error {
 	n := len(buf)
 	nr, err := fd.ReadAt(buf, blk*int64(n))
 	if err != nil {
-		return fmt.Errorf("db i/o error: %v", err)
-	}
-	if nr != 0 && nr != n {
-		return fmt.Errorf("db i/o error: short read: want %d got %d", n, nr)
-	}
-	if nr == 0 {
-		clear(buf)
+		if err == io.EOF && nr == 0 {
+			clear(buf)
+			return nil
+		}
+		return fmt.Errorf("dbm read error, block %d: %w", blk, err)
 	}
 	return nil
 }
@@ -485,7 +559,7 @@ func readBlock(fd *os.File, buf []byte, blk int64) error {
 func writeBlock(fd *os.File, buf []byte, blk int64) error {
 	_, err := fd.WriteAt(buf, blk*int64(len(buf)))
 	if err != nil {
-		return fmt.Errorf("db write error: %v", err)
+		return fmt.Errorf("dbm write error, block %d: %w", blk, err)
 	}
 	return nil
 }
