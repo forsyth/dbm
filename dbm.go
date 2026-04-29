@@ -27,7 +27,7 @@ var (
 	ErrNotFound       = errors.New("key not found")
 	ErrNotPaired      = errors.New("items not in pairs")
 	ErrReadOnly       = errors.New("read-only file")
-	ErrSplitNotPaired = errors.New("split not paired")
+	ErrSplitNotPaired = errors.New("split found key/value not paired")
 	ErrTooLarge       = errors.New("key/value too large")
 )
 
@@ -46,19 +46,21 @@ type File struct {
 	pageBuf   []byte
 	dirBlkno  int64 // current block in dirBuf
 	dirBuf    []byte
+	ovfBuf    []byte
 }
 
 // Create makes a new dbm database, with the given name as the base name,
 // and returns a File that can access it.
+// If the database already exists, it is truncated.
 // Currently a database has two underlying storage files for a given name N: N.pag and N.dat.
 func Create(name string) (*File, error) {
 	pf, err := os.Create(name + ".pag")
 	if err != nil {
-		return nil, fmt.Errorf("cannot create %s.pag: %w", err)
+		return nil, fmt.Errorf("cannot create %s.pag: %w", name, err)
 	}
 	df, err := os.Create(name + ".dir")
 	if err != nil {
-		return nil, fmt.Errorf("cannot create %s.dir: %w", err)
+		return nil, fmt.Errorf("cannot create %s.dir: %w", name, err)
 	}
 	return alloc(pf, df, true)
 }
@@ -74,11 +76,11 @@ func Open(name string) (*File, error) {
 func OpenFile(name string, flag int, perms os.FileMode) (*File, error) {
 	pf, err := os.OpenFile(name+".pag", flag, perms)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open %s.pag: %w", err)
+		return nil, fmt.Errorf("cannot open %s.pag: %w", name, err)
 	}
 	df, err := os.OpenFile(name+".dir", flag, perms)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open %s.dir: %w", err)
+		return nil, fmt.Errorf("cannot open %s.dir: %w", name, err)
 	}
 	return alloc(pf, df, flag != os.O_RDONLY)
 }
@@ -94,6 +96,7 @@ func alloc(pf *os.File, df *os.File, writable bool) (*File, error) {
 		writable:  writable,
 		pageBuf:   make([]byte, pageBlockSize),
 		dirBuf:    make([]byte, dirBlockSize),
+		ovfBuf:    make([]byte, pageBlockSize),
 		pageBlkno: -1,
 		dirBlkno:  -1,
 		maxbno:    d.Size()*byteBits - 1,
@@ -136,7 +139,7 @@ func (db *File) Fetch(key []byte) ([]byte, error) {
 	for i := 0; ; i += shortBytes {
 		item := mkItem(db.pageBuf, i)
 		if item == nil {
-			return nil, ErrCorrupt
+			return nil, nil
 		}
 		if cmpDatum(key, item) == 0 {
 			item = mkItem(db.pageBuf, i+1)
@@ -173,13 +176,21 @@ func (db *File) Delete(key []byte) error {
 	return writeBlock(db.pagf, db.pageBuf, db.blkno)
 }
 
-// Store stores the (key, data) pair.
+// RecordFits returns true iff the given key and data can be stored in the database.
+func (db *File) RecordFits(key []byte, dat []byte) bool {
+	// using < not <= for compatibility with the original.
+	return len(key)+len(dat)+3*shortBytes < pageBlockSize
+}
+
+// Store stores the (key, data) pair and returns nil (no error) on success.
 // If replace is true and key already has an associated value, Store replaces that by the new data;
 // otherwise it returns error ErrDuplicate.
-// On success, nil is returned.
 func (db *File) Store(key []byte, data []byte, replace bool) error {
 	if db.IsReadOnly() {
 		return ErrReadOnly
+	}
+	if !db.RecordFits(key, data) {
+		return ErrTooLarge
 	}
 	for {
 		err := db.access(calchash(key))
@@ -200,6 +211,7 @@ func (db *File) Store(key []byte, data []byte, replace bool) error {
 				break
 			}
 		}
+		// key and data must be on the same page
 		i := addItem(db.pageBuf, key)
 		if i >= 0 {
 			if addItem(db.pageBuf, data) >= 0 {
@@ -207,7 +219,7 @@ func (db *File) Store(key []byte, data []byte, replace bool) error {
 			}
 			delItem(db.pageBuf, i)
 		}
-		if err := db.split(key, data); err != nil {
+		if err := db.split(); err != nil {
 			return err
 		}
 	}
@@ -215,45 +227,33 @@ func (db *File) Store(key []byte, data []byte, replace bool) error {
 	return writeBlock(db.pagf, db.pageBuf, db.blkno)
 }
 
-// MaxRecord returns the size of the largest key and data combination allowed.
-func (db *File) MaxRecord() int {
-	return pageBlockSize - 4*shortBytes
-}
-
-// RecordFits returns true iff the given key and data can be stored in the database.
-func (db *File) RecordFits(key []byte, dat []byte) bool {
-	return len(key)+len(dat)+4*shortBytes <= pageBlockSize
-}
-
-func (db *File) split(key []byte, dat []byte) error {
-	if !db.RecordFits(key, dat) {
-		return ErrTooLarge
-	}
-	ovfbuf := make([]byte, pageBlockSize)
+func (db *File) split() error {
+	clear(db.ovfBuf)
 	for i := 0; ; {
 		item := mkItem(db.pageBuf, i)
 		if item == nil {
 			break
 		}
-		if (calchash(item) & (db.hmask + 1)) != 0 {
-			addItem(ovfbuf, item)
-			delItem(db.pageBuf, i)
-			item = mkItem(db.pageBuf, i)
-			if item == nil {
-				return ErrSplitNotPaired
-			}
-			addItem(ovfbuf, item)
-			delItem(db.pageBuf, i)
+		if (calchash(item) & (db.hmask + 1)) == 0 {
+			i += shortBytes
 			continue
 		}
-		i += shortBytes
+		// shunt selected key/value pairs from current page to the overflow page
+		addItem(db.ovfBuf, item)
+		delItem(db.pageBuf, i)
+		item = mkItem(db.pageBuf, i)
+		if item == nil {
+			return ErrSplitNotPaired
+		}
+		addItem(db.ovfBuf, item)
+		delItem(db.pageBuf, i)
 	}
 	err := writeBlock(db.pagf, db.pageBuf, db.blkno)
 	if err != nil {
 		return err
 	}
 	db.pageBlkno = db.blkno
-	err = writeBlock(db.pagf, ovfbuf, db.blkno+int64(db.hmask+1))
+	err = writeBlock(db.pagf, db.ovfBuf, db.blkno+int64(db.hmask+1))
 	if err != nil {
 		return err
 	}
