@@ -139,7 +139,7 @@ func (db *File) Fetch(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; ; i += shortBytes {
+	for i := 0; ; i += 2 {
 		item := mkItem(db.pageBuf, i)
 		if item == nil {
 			return nil, nil
@@ -164,7 +164,7 @@ func (db *File) Delete(key []byte) error {
 	if err != nil {
 		return err
 	}
-	for i := 0; ; i += shortBytes {
+	for i := 0; ; i += 2 {
 		item := mkItem(db.pageBuf, i)
 		if item == nil {
 			return ErrNotFound
@@ -195,12 +195,13 @@ func (db *File) Store(key []byte, data []byte, replace bool) error {
 	if !db.RecordFits(key, data) {
 		return ErrTooLarge
 	}
+	hash := calchash(key)
 	for {
-		err := db.access(calchash(key))
+		err := db.access(hash)
 		if err != nil {
 			return err
 		}
-		for i := 0; ; i += shortBytes {
+		for i := 0; ; i += 2 {
 			item := mkItem(db.pageBuf, i)
 			if item == nil {
 				break
@@ -238,7 +239,7 @@ func (db *File) split() error {
 			break
 		}
 		if (calchash(item) & (db.hmask + 1)) == 0 {
-			i += shortBytes
+			i += 2
 			continue
 		}
 		// shunt selected key/value pairs from current page to the overflow page
@@ -283,7 +284,7 @@ func (db *File) NextKey(key []byte) ([]byte, error) {
 		return nil, err
 	}
 	var item, bitem []byte
-	for i := 0; ; i += shortBytes {
+	for i := 0; ; i += 2 {
 		item = mkItem(db.pageBuf, i)
 		if item == nil {
 			break
@@ -317,7 +318,7 @@ func (db *File) firstHash(hash hash) ([]byte, error) {
 		}
 		bitem := mkItem(db.pageBuf, 0)
 		var item []byte
-		for i := shortBytes; ; i += shortBytes {
+		for i := 2; ; i += 2 {
 			item = mkItem(db.pageBuf, i)
 			if item == nil {
 				break
@@ -513,6 +514,9 @@ func delItem(buf []byte, n int) error {
 	return nil
 }
 
+// addItem adds an item to the page buffer,
+// returning the resulting number of entries.
+// It returns -1 if the item will not fit.
 func addItem(buf []byte, item []byte) int {
 	i1 := pageBlockSize
 	ne := get16(buf, 0)
