@@ -1,35 +1,31 @@
 .TH DBM 2
 .SH NAME
-Dbm: Dbf, init \- data base with hashed indexing
+dbm \- data base with extensible hashed indexing
 .SH SYNOPSIS
 .EX
-include "dbm.m";
+import "github.com/forsyth/dbm"
 
-dbm := load Dbm Dbm->PATH;
-Datum, Dbf: import dbm;
+type File struct {
+    // symbols not exported
+}
 
-Datum:  type array of byte;
+func Create(name string, perm int) (*File, error)
+func Open(name string) (*File, error)
+func OpenFile(name string, flag int, perms os.FileMode) (*File, error)
 
-Dbf: adt {
-    create: fn(file: string, perm: int): ref Dbf;
-    open:   fn(file: string, flags: int): ref Dbf;
+func (db *File) Fetch(key []byte) ([]byte, error)
+func (db *File) Store(key []byte, data []byte., replace bool) error
+func (db *File) Delete(key []byte) error
 
-    fetch:  fn(db: self ref Dbf, key: Datum): Datum;
-    delete: fn(db: self ref Dbf, key: Datum): int;
-    store:  fn(db: self ref Dbf, key: Datum, data: Datum,
-                  replace: int): int;
+func (db *File) FirstKey() ([]byte, error)
+func (db *File) NextKey(key []byte) ([]byte, error)
 
-    firstkey: fn(db: self ref Dbf): Datum;
-    nextkey:  fn(db: self ref Dbf, key: Datum): Datum;
-
-    flush:    fn(db: self ref Dbf);
-    isrdonly: fn(db: self ref Dbf): int;
-};
-
-init:   fn();
+func (db *File) Flush() error
+func (db *File) Reset()
+func (db *File) IsReadOnly() bool
 .EE
 .SH DESCRIPTION
-.B Dbm
+.I Dbm
 maintains
 key/content pairs in a data base.
 The functions will handle very large
@@ -40,9 +36,7 @@ in one or two filesystem accesses.
 .IR Key s
 and
 .IR content s
-are both represented by arrays of bytes
-(with the synonym
-.BR Datum ),
+are both represented by byte slices
 allowing
 arbitrary binary values.
 .PP
@@ -55,100 +49,95 @@ The second file contains all data and has
 .L .pag
 as its suffix.
 An application can access several databases at once, but must avoid
-concurrent operations on any one database (eg, by using a monitor process to control access).
-.PP
-.B Init
-must be called before any other operation of the module.
+concurrent operations on any one database (eg, by using a monitor goroutine to control access).
 .PP
 A database is created by
-.IR Dbf.create ,
+.BR dbm.Create ,
 which accepts a file permission parameter
 .IR perm ,
 as described for
-.B Sys->create
-(see
-.IR sys-open (2));
+.BR os.Create ;
 it creates the two files
-.IB file .dir
+.IB name .dir
 and
-.IB file .pag .
+.IB name .pag .
 If successful, it returns a
-.B Dbf
-reference describing the database, which
+.B File
+pointer describing the database, which
 is open for reading and writing.
-(It will truncate an existing database.)
-It returns nil if it cannot create the database for some reason,
-and sets the error string.
+.B Create
+will truncate an existing database.
+It returns an error if it cannot create the database for some reason.
 .PP
-.B Dbf.open
-accepts a
-.I mode
-parameter as described in
-.IR sys-open (2),
-and opens the existing database in
-.IB file .dir
+.BR dbm.Open
+opens an existing database in
+.IB name .dir
 and
-.IB file .pag .
+.IB name .pag
+for reading and writing.
 If successful, it returns a
-.B Dbf
-reference describing the database,
-which is open either for reading and writing (ie,
-.BR Sys->ORDWR ),
-or only for reading
-.RB ( Sys->OREAD )
-as determined by
-.IR mode .
-It returns nil if the database cannot be opened successfully, and sets the error string.
+.B File
+pointer describing the database.
+.PP
+.BR dbm.OpenFile
+is the generalised open file: it
+takes similar parameters to
+.B os.OpenFile
+for flags, and permissions if
+.B O_CREATE
+is passed in flags.
+It returns an error if the database cannot be opened successfully.
 .PP
 The remaining operations apply to an existing
-.B Dbf
-reference
+.B *dbm.File
+value
 .IR db :
 .TP
-.IB db .fetch( key )
+.IB db .Fetch( key )
 Return the data stored under a
 .IR key ;
 nil is returned if the key is not in the database.
 .TP
-.IB db .store( key,\ data,\ replace )
+.IB db .Store( key,\ data,\ replace )
 Store
 .I data
 under the given
 .IR key .
 If
 .I replace
-is non-zero,
-.B store
+is true,
+.B Store
 will simply replace the existing value by the new one if the key is already
 in the database;
 if
 .I replace
-is zero
-.B store
-will return 0 if the new item was inserted, but
-1 if the key already appears in the database,
+is false,
+.B Store
+will return an error iff the key already appears in the database,
 and the new value will not be stored.
 .TP
-.IB db .delete( key )
+.IB db .Delete( key )
 .I Key
 and its associated value
 is removed from the database.
 .TP
-.IB db .firstkey()
+.IB db .FirstKey()
 Return the first key in the database;
 return nil if the database is empty.
 .TP
-.IB db .nextkey( key )
+.IB db .NextKey( key )
 Return the key following the given
 .IR key ,
-or nil if there is none.
+or an error if there is none.
 .TP
-.IB db .flush()
+.IB db.Flush
+.TP
+.IB db.Reset
 Discard any data cached from the file.
 The cache is write-through, so it is not necessary to flush the file
 before the application exits.
 .TP
-.IB db .isrdonly()
+.IB db .IsReadOnly()
 Return true if
 .I db
 was opened only for reading and writes are not allowed.
@@ -158,38 +147,32 @@ A linear pass through all keys in a database
 may be made,
 in an (apparently) random order,
 by use of
-.B Dbf.firstkey
+.B FirstKey
 and
-.BR Dbf.nextkey .
+.BR NextKey .
 This code will traverse the data base:
 .IP
 .EX
-for(key := db.firstkey(); key != nil; key = db.nextkey(key)){
-	d := db.fetch(key);
+for key, err := db.FirstKey(); err == nil; key = db.NextKey(key) {
+	data, err := db.Fetch(key)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error fetching key %s: %s", string(key), err)
+		break
+	}
+	fmt.Printf("%s\n", string(key), string(data))
 }
 .EE
 .PP
 The order of keys presented by
-.B Dbf.firstkey
+.B FirstKey
 and
-.B Dbf.nextkey
+.B NextKey
 depends on a hashing function, not on anything
 interesting.
 .SH SOURCE
-.B /appl/lib/dbm.b
-.SH DIAGNOSTICS
-All functions that return an
-.I int
-indicate errors with negative values.
-A zero return indicates success.
-Routines that return pointers, including values of
-.BR Datum ,
-return nil values on error.
-.B Dbf.create
-and
-.B Dbf.open
-return nil on failure to access the database,
-setting the error string to a more detailed diagnostic.
+.B github.com/forsyth/dbm/dbm.go
+.br
+.B github.com/forsyth/dbm/cmd
 .SH BUGS
 On some systems (notably Plan 9 but also some Unix systems),
 the
@@ -201,22 +184,12 @@ These files cannot be copied
 by normal means (cp, cat)
 without filling in the holes.
 .PP
-Except for
-.B firstkey
-and
-.BR nextkey ,
-.B Datum
-values returned
-by these functions
-point to storage
-that is changed by subsequent calls.
-.PP
 The sum of the sizes of a
 key/content pair must not exceed
 the internal block size
 (currently 512 bytes).
 Moreover all key/content pairs that hash
-together must fit on a single block.
-.B Dbf.store
+together must fit in a single block.
+.B Store
 will return an error in the event that
 a block fills with inseparable data.
