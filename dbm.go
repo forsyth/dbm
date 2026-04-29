@@ -1,6 +1,9 @@
+// Package dbm provides a small, simple key/value store implemented
+// using an extensible hash function.
+// It is a Go version of the original
 package dbm
 
-// Copyright © Caldera International Inc.  2001-2002
+// Original C code Copyright © Caldera International Inc.  2001-2002
 // Limbo transliteration (with amendment) Copyright © 2004 Vita Nuova Holdings Limited
 // Go version Copyright © 2024 Charles Forsyth (charles.forsyth@gmail.com)
 
@@ -123,7 +126,7 @@ func (db *File) Close() {
 	db.pagf.Close()
 }
 
-// IsReadOnly returns true iff the file was opened only for reading and cannot be updated.
+// IsReadOnly reports whether the file was opened only for reading and cannot be updated.
 func (db *File) IsReadOnly() bool {
 	return !db.writable
 }
