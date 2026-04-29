@@ -103,18 +103,14 @@ Store
 .I data
 under the given
 .IR key .
-If
+If the key already appears in the database,
+.B Store
+will return an error
+.L ErrDuplicate
+unless
 .I replace
 is true,
-.B Store
-will simply replace the existing value by the new one if the key is already
-in the database;
-if
-.I replace
-is false,
-.B Store
-will return an error iff the key already appears in the database,
-and the new value will not be stored.
+causing it to replace the existing value by the new one.
 .TP
 .IB db .Delete( key )
 .I Key
@@ -131,6 +127,8 @@ Return the key following the given
 or an error if there is none.
 .TP
 .IB db.Flush
+Ensure any data cached is written to the underlying files,
+and clear the cache.
 .TP
 .IB db.Reset
 Discard any data cached from the file.
@@ -141,6 +139,15 @@ before the application exits.
 Return true if
 .I db
 was opened only for reading and writes are not allowed.
+.PP
+A datbase traversal using
+.B FirstKey
+and
+.BR NextKey ,
+must stop if the database is modified using
+.B Store
+or
+.BR Delete .
 .SH EXAMPLE
 .PP
 A linear pass through all keys in a database
@@ -153,7 +160,7 @@ and
 This code will traverse the data base:
 .IP
 .EX
-for key, err := db.FirstKey(); err == nil; key = db.NextKey(key) {
+for key, err := db.FirstKey(); key != nil && err == nil; key, err = db.NextKey(key) {
 	data, err := db.Fetch(key)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error fetching key %s: %s", string(key), err)
@@ -169,6 +176,29 @@ and
 .B NextKey
 depends on a hashing function, not on anything
 interesting.
+.SH DIAGNOSTICS
+.TF ErrSplitNotPaired
+.TP
+.L ErrCorrupt
+corrupt data block
+.TP
+.L ErrDuplicate
+key already exists
+.TP
+.L ErrNotFound
+key not found
+.TP
+.L ErrNotPaired
+corrupt database or internal error
+.TP
+.L ErrReadOnly
+read-only file
+.TP
+.L ErrSplitNotPaired
+corrupt database or internal error
+.TP
+.L ErrTooLarge
+key/value too large
 .SH SOURCE
 .B github.com/forsyth/dbm/dbm.go
 .br
