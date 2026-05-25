@@ -12,7 +12,6 @@ package dbm
 // Go version Copyright © 2024 Charles Forsyth (charles.forsyth@gmail.com)
 
 import (
-	//	"encoding/binary"
 	"bytes"
 	"errors"
 	"fmt"
@@ -147,7 +146,7 @@ func (db *File) IsReadOnly() bool {
 // or nil if key does not exist.
 // If an error is returned, the database is in bad shape.
 func (db *File) Fetch(key []byte) ([]byte, error) {
-	err := db.access(calchash(key))
+	err := db.access(calcHash(key))
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +171,7 @@ func (db *File) Delete(key []byte) error {
 	if db.IsReadOnly() {
 		return ErrReadOnly
 	}
-	err := db.access(calchash(key))
+	err := db.access(calcHash(key))
 	if err != nil {
 		return err
 	}
@@ -207,7 +206,7 @@ func (db *File) Store(key []byte, data []byte, replace bool) error {
 	if !db.RecordFits(key, data) {
 		return ErrTooLarge
 	}
-	hash := calchash(key)
+	hash := calcHash(key)
 	for {
 		err := db.access(hash)
 		if err != nil {
@@ -243,6 +242,10 @@ func (db *File) Store(key []byte, data []byte, replace bool) error {
 	return writeBlock(db.pagf, db.pageBuf, db.blkno)
 }
 
+// split splits the current block to try to make space for a new
+// key, value pair. It extends the hash function by one bit, and
+// moves the pairs that new bit covers into the new block,
+// adding the bit to the hash directory.
 func (db *File) split() error {
 	clear(db.ovfBuf)
 	for i := 0; ; {
@@ -250,7 +253,7 @@ func (db *File) split() error {
 		if item == nil {
 			break
 		}
-		if (calchash(item) & (db.hmask + 1)) == 0 {
+		if (calcHash(item) & (db.hmask + 1)) == 0 {
 			// new hash bit not set, doesn't move
 			i += 2
 			continue
@@ -291,7 +294,7 @@ func (db *File) FirstKey() ([]byte, error) {
 // NextKey returns the value of the key immediately following the given one,
 // to continue iterating over the set of keys.
 func (db *File) NextKey(key []byte) ([]byte, error) {
-	hash := calchash(key)
+	hash := calcHash(key)
 	err := db.access(hash)
 	if err != nil {
 		return nil, err
@@ -350,6 +353,9 @@ func (db *File) firstHash(hash hash) ([]byte, error) {
 	}
 }
 
+// access, given a [hash] will load the bucket that has
+// the data for that hash value, or an error if there
+// is an IO error or inconsistency.
 func (db *File) access(hash hash) error {
 	for db.hmask = 0; ; db.hmask = (db.hmask << 1) + 1 {
 		db.blkno = int64(hash & db.hmask)
@@ -412,6 +418,9 @@ func (db *File) setBit() error {
 	return writeBlock(db.dirf, db.dirBuf, b)
 }
 
+// mkItem returns a slice of [buf] referring to the
+// [n]'th item in the bucket (either key or value),
+// returning nil if there is no item for the index [n].
 func mkItem(buf []byte, n int) []byte {
 	ne := get16(buf, 0)
 	if n < 0 || n >= ne {
@@ -481,7 +490,11 @@ func (db *File) hashInc(hash hash) hash {
 	}
 }
 
-func calchash(item []byte) hash {
+// calcHash returns the hash value for the given [item], any slice of bytes.
+// As the USENIX paper observes, this ``bit-randomizing'' hash function
+// ``is important to obtain radically different hash values for nearly identical keys,
+// which in turn avoids clustering of such keys in a single bucket''.
+func calcHash(item []byte) hash {
 	hashl := hash(0)
 	hashi := hash(0)
 	for i := 0; i < len(item); i++ {
@@ -495,6 +508,8 @@ func calchash(item []byte) hash {
 	return hashl
 }
 
+// delItem removes the [n]'th item from the bucket
+// [buf], returning an error if the bucket is corrupt.
 func delItem(buf []byte, n int) error {
 	ne := get16(buf, 0)
 	if n < 0 || n >= ne {
@@ -523,8 +538,9 @@ func delItem(buf []byte, n int) error {
 	return nil
 }
 
-// addItem adds an item to the page buffer,
-// returning the resulting number of entries.
+// addItem adds an [item] to the bucket [buf],
+// returning the resulting number of entries
+// (the index of the next entry).
 // It returns -1 if the item will not fit.
 func addItem(buf []byte, item []byte) int {
 	i1 := pageBlockSize
@@ -545,6 +561,9 @@ func addItem(buf []byte, item []byte) int {
 	return ne
 }
 
+// checkBlock applies some rudimentary consistency
+// checks on the index section of the bucket,
+// returning an error if it is corrupt.
 func checkBlock(buf []byte) error {
 	t := pageBlockSize
 	ne := get16(buf, 0)
