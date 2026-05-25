@@ -203,7 +203,7 @@ func (db *File) Delete(key []byte) error {
 	return writeBlock(db.pagf, db.pageBuf, db.blkno)
 }
 
-// RecordFits returns true iff the given key and data can be stored in the database.
+// RecordFits reports whether the given key and data can be stored in the database, given their size.
 func (db *File) RecordFits(key []byte, dat []byte) bool {
 	// using < not <= for compatibility with the original.
 	return len(key)+len(dat)+3*shortBytes < pageBlockSize
@@ -504,9 +504,9 @@ func (db *File) hashInc(hash hash) hash {
 }
 
 // calcHash returns the hash value for the given [item], any slice of bytes.
-// As the USENIX paper observes, this ``bit-randomizing'' hash function
-// ``is important to obtain radically different hash values for nearly identical keys,
-// which in turn avoids clustering of such keys in a single bucket''.
+// As the USENIX paper observes, this “bit-randomizing” hash function
+// “is important to obtain radically different hash values for nearly identical keys,
+// which in turn avoids clustering of such keys in a single bucket”.
 func calcHash(item []byte) hash {
 	hashl := hash(0)
 	hashi := hash(0)
