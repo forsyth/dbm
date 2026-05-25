@@ -1,6 +1,19 @@
-// Package dbm provides a small, simple key/value store implemented
+// Package dbm provides a small, simple key/value store or associative memory implemented
 // using an extensible hash function.
-// It is a Go version of the original.
+// Both keys and values are byte slices.
+//
+// The main operations are straightforward: [Create], [Open], [Store], [Fetch], [Delete] and [Close].
+// [FirstKey] and [NextKey] provide iteration by keys (in no particular order).
+//
+// [Create] and [Open] return a database [File].
+// The database operations are on the [File].
+//
+// [Store] stores the value associated with a key, optionally replacing an existing value
+// or returning an error.
+// [Fetch] retrieves any value associated with a key.
+// [Delete] removes a key/value association, returning an error if the key is not found.
+//
+// [dbm] is a Go version of the original by Ken Thompson distributed in 7th Edition Unix.
 // A USENIX paper [Seltzer & Yigit] discusses all the dbm/ndbm/sdbm variants,
 // including the extensible hash variants.
 //
