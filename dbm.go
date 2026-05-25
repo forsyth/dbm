@@ -1,9 +1,13 @@
 // Package dbm provides a small, simple key/value store implemented
 // using an extensible hash function.
-// It is a Go version of the original
+// It is a Go version of the original.
+// A USENIX paper [Seltzer & Yigit] discusses all the dbm/ndbm/sdbm variants,
+// including the extensible hash variants.
+//
+// [Seltzer & Yigit:] https://www.usenix.org/legacy/publications/library/proceedings/seltzer2.pdf
 package dbm
 
-// Original C code Copyright © Caldera International Inc.  2001-2002
+// Original C code Copyright © AT&T 1979 (Ken Thompson)
 // Limbo transliteration (with amendment) Copyright © 2004 Vita Nuova Holdings Limited
 // Go version Copyright © 2024 Charles Forsyth (charles.forsyth@gmail.com)
 
@@ -25,6 +29,7 @@ const (
 )
 
 var (
+	ErrBadOpen        = errors.New("bad open file flag")
 	ErrCorrupt        = errors.New("corrupt data block")
 	ErrDuplicate      = errors.New("key already exists")
 	ErrNotFound       = errors.New("key not found")
@@ -49,11 +54,11 @@ type File struct {
 	pageBuf   []byte
 	dirBlkno  int64 // current block in dirBuf
 	dirBuf    []byte
-	ovfBuf    []byte
+	ovfBuf    []byte // block with pairs split from pageBuf
 }
 
 // Create makes a new dbm database, with the given name as the base name,
-// and returns a File that can access it.
+// and returns a [File] that can access it.
 // If the database already exists, it is truncated.
 // Currently a database has two underlying storage files for a given name N: N.pag and N.dat.
 func Create(name string) (*File, error) {
@@ -73,10 +78,17 @@ func Open(name string) (*File, error) {
 	return OpenFile(name, os.O_RDWR, 0o666)
 }
 
-// OpenFile opens the dbm file in the mode given by flag:
-// O_RDONLY for only reading, or O_RDWR for reading and writing (updating).
+// OpenFile opens the dbm file in the mode given by [flag]:
+// [os.O_RDONLY] for only reading, or [os.O_RDWR] for reading and writing (updating).
+// Neither [os.O_WRONLY] nor [os.O_APPEND] are allowed in a [flag].
+// If a file does not exist and [os.O_CREATE] creates it, the file permissions
+// are set to [perms].
 // An error is returned if any underlying OS files cannot be opened.
 func OpenFile(name string, flag int, perms os.FileMode) (*File, error) {
+	if (flag&(os.O_RDONLY|os.O_WRONLY|os.O_RDWR)) == os.O_WRONLY ||
+		(flag&os.O_APPEND) != 0 {
+		return nil, ErrBadOpen
+	}
 	pf, err := os.OpenFile(name+".pag", flag, perms)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open %s.pag: %w", name, err)
@@ -239,10 +251,11 @@ func (db *File) split() error {
 			break
 		}
 		if (calchash(item) & (db.hmask + 1)) == 0 {
+			// new hash bit not set, doesn't move
 			i += 2
 			continue
 		}
-		// shunt selected key/value pairs from current page to the overflow page
+		// shunt key/value pairs selected by new hash from current page to the overflow page
 		addItem(db.ovfBuf, item)
 		delItem(db.pageBuf, i)
 		item = mkItem(db.pageBuf, i)
@@ -346,6 +359,7 @@ func (db *File) access(hash hash) error {
 			return err
 		}
 		if b == 0 {
+			// not split, stop
 			break
 		}
 	}
@@ -419,12 +433,7 @@ func cmpDatum(d1 []byte, d2 []byte) int {
 	if n == 0 {
 		return 0
 	}
-	for i := range d1 {
-		if d1[i] != d2[i] {
-			return int(d1[i]) - int(d2[i])
-		}
-	}
-	return 0
+	return bytes.Compare(d1, d2)
 }
 
 // ken's
@@ -489,7 +498,7 @@ func calchash(item []byte) hash {
 func delItem(buf []byte, n int) error {
 	ne := get16(buf, 0)
 	if n < 0 || n >= ne {
-		return fmt.Errorf("corrupt file: bad item index: %d", n)
+		return ErrCorrupt
 	}
 	i1 := get16(buf, n+1)
 	i2 := pageBlockSize
@@ -498,11 +507,11 @@ func delItem(buf []byte, n int) error {
 	}
 	i3 := get16(buf, ne+1-1)
 	if i2 > i1 {
-		for i1 > i3 {
-			i1--
-			i2--
-			buf[i2] = buf[i1]
-			buf[i1] = 0
+		if d := i1 - i3; d > 0 {
+			i2 -= d
+			copy(buf[i2:], buf[i3:i1])
+			clear(buf[i3:i2])
+			i1 -= d
 		}
 	}
 	i2 -= i1
@@ -526,6 +535,8 @@ func addItem(buf []byte, item []byte) int {
 	i1 -= len(item)
 	i2 := (ne + 2) * shortBytes
 	if i1 <= i2 {
+		// not enough space for key and value
+		// index entries
 		return -1
 	}
 	put16(buf, ne+1, i1)
