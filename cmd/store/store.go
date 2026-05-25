@@ -28,7 +28,7 @@ func main() {
 			s := f.Text()
 			key, val, err := kvLine(s)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "dbm/store: %s", err)
+				fmt.Fprintf(os.Stderr, "dbm/store: %s\n", err)
 				nerr++
 				continue
 			}
