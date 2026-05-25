@@ -23,7 +23,7 @@ vet:V:
 	go vet
 
 fmt:V:
-	go fmt
+	go fmt ./...
 
 nuke:V: clean
 	rm -f $TARG
