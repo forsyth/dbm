@@ -9,9 +9,8 @@ TARG=\
 
 TARGDIR=${TARG:%=./cmd/%}
 
-all:V:
+all:V: vet
 	for a in $TARGDIR; do go build $a; done
-	go vet $TARGDIR
 
 build:V:
 	go build
@@ -20,7 +19,7 @@ clean:V:
 	go clean ./...
 
 vet:V:
-	go vet
+	go vet $TARGDIR
 
 fmt:V:
 	go fmt ./...
